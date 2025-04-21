@@ -253,6 +253,26 @@ public abstract class BaseDeltaLakeConnectorSmokeTest
     }
 
     @Test
+    public void testCreateTableWithRowTrackingProperty()
+    {
+        //https://learn.microsoft.com/zh-cn/azure/databricks/delta/row-tracking
+        String tableName = "test_table_with_delta_enableRowTracking" + randomNameSuffix();
+        String location = getLocationForTable(bucketName, tableName);
+
+        hiveHadoop.runOnHive(format(
+                """
+                    CREATE TABLE default.%s
+                    (a INT)
+                    USING DELTA
+                    LOCATION %s
+                """, tableName, location));
+
+        assertThatThrownBy(() -> query("SELECT * FROM " + tableName))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("fdasf");
+    }
+
+    @Test
     public void testDropSchemaExternalFiles()
     {
         String schemaName = "externalFileSchema";
