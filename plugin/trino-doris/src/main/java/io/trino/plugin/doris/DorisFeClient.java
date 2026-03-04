@@ -1,24 +1,49 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.trino.plugin.doris;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
+import com.google.common.base.Ticker;
+import com.google.common.cache.Cache;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.UncheckedExecutionException;
 import io.airlift.log.Logger;
+import io.airlift.units.Duration;
+import io.trino.Session;
+import io.trino.cache.EvictableCacheBuilder;
 import io.trino.plugin.jdbc.BaseJdbcConfig;
+import io.trino.plugin.jdbc.CachingJdbcClient;
 import io.trino.plugin.jdbc.CaseSensitivity;
 import io.trino.plugin.jdbc.ColumnMapping;
+import io.trino.plugin.jdbc.IdentityCacheMapping;
+import io.trino.plugin.jdbc.JdbcColumnHandle;
+import io.trino.plugin.jdbc.JdbcProcedureHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongReadFunction;
 import io.trino.plugin.jdbc.LongWriteFunction;
 import io.trino.plugin.jdbc.ObjectReadFunction;
 import io.trino.plugin.jdbc.ObjectWriteFunction;
 import io.trino.plugin.jdbc.PredicatePushdownController;
+import io.trino.plugin.jdbc.PreparedQuery;
 import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.RemoteTableName;
 import io.trino.plugin.jdbc.UnsupportedTypeHandling;
+import io.trino.spi.HostAddress;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorSession;
@@ -26,6 +51,7 @@ import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.DynamicFilter;
+import io.trino.spi.connector.RelationCommentMetadata;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.predicate.Domain;
@@ -34,6 +60,7 @@ import io.trino.spi.predicate.Range;
 import io.trino.spi.predicate.SortedRangeSet;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.predicate.ValueSet;
+import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.Decimals;
 import io.trino.spi.type.LongTimestampWithTimeZone;
@@ -78,12 +105,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Strings.emptyToNull;
+import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
@@ -92,10 +122,6 @@ import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.plugin.base.util.JsonTypeUtil.jsonParse;
 import static io.trino.plugin.jdbc.CaseSensitivity.CASE_INSENSITIVE;
 import static io.trino.plugin.jdbc.CaseSensitivity.CASE_SENSITIVE;
-import static io.trino.plugin.jdbc.DecimalConfig.DecimalMapping.ALLOW_OVERFLOW;
-import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalDefaultScale;
-import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRounding;
-import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRoundingMode;
 import static io.trino.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
 import static io.trino.plugin.jdbc.JdbcMetadataSessionProperties.getDomainCompactionThreshold;
 import static io.trino.plugin.jdbc.PredicatePushdownController.CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
@@ -153,6 +179,12 @@ import static java.sql.DatabaseMetaData.columnNoNulls;
 import static java.time.format.DateTimeFormatter.ISO_DATE;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
+import static io.trino.plugin.doris.DorisSessionProperties.getDecimalRounding;
+import static io.trino.plugin.doris.DorisSessionProperties.getDecimalRoundingMode;
+import static io.trino.plugin.doris.DorisSessionProperties.getDecimalDefaultScale;
+import static io.trino.plugin.doris.DorisConfig.DecimalMapping.ALLOW_OVERFLOW;
 
 public class DorisFeClient
 {
@@ -200,13 +232,29 @@ public class DorisFeClient
 //    private final DriverConnectionFactory connectionFactory;
 //    private final GenericObjectPool<Connection> pool;
     private final DorisConfig dorisConfig;
+    private final ClientPool clientPool;
+
+    // for cache
+    // specifies whether missing values should be cached
+    private final boolean cacheMissing;
+    private final Cache<ConnectorSession, List<String>> schemaNamesCache;
+    private final Cache<TableListingCacheKey, List<String>> tableNamesCache;
+    private final Cache<TableHandlesByNameCacheKey, Optional<DorisTableHandle>> tableHandlesByNameCache;
+    private final Cache<TableHandlesByQueryCacheKey, DorisTableHandle> tableHandlesByQueryCache;
+    private final Cache<ProcedureHandlesByQueryCacheKey, JdbcProcedureHandle> procedureHandlesByQueryCache;
+    private final Cache<ColumnsCacheKey, List<DorisColumnHandle>> columnsCache;
+    private final Cache<TableListingCacheKey, List<RelationCommentMetadata>> tableCommentsCache;
+    private final Cache<DorisTableHandle, TableStatistics> statisticsCache;
+    private final Cache<RemoteTableName, List<DorisColumnHandle>> tablePrimaryKeysCache;
+    private final Cache<DorisTableHandle, Map<String, Object>> tablePropertiesCache;
 
     @Inject
     public DorisFeClient(
+            ClientPool clientPool,
             BaseJdbcConfig jdbcConfig,
             DorisConfig config,
-            QueryBuilder queryBuilder,
             TypeManager typeManager) {
+        this.clientPool = clientPool;
         this.jdbcTypesMappedToVarchar = ImmutableSortedSet.orderedBy(CASE_INSENSITIVE_ORDER)
                 .addAll(requireNonNull(jdbcConfig.getJdbcTypesMappedToVarchar(), "jdbcTypesMappedToVarchar is null"))
                 .build();
@@ -214,57 +262,285 @@ public class DorisFeClient
         this.jsonType = typeManager.getType(new TypeSignature(StandardTypes.JSON));
         this.dorisConfig = config;
 
+        this.httpClient = new OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+//                    .authenticator(((route, response) -> response.request().newBuilder()
+//                            .header("Authorization", Credentials.basic(config.getFeUser(), config.getFePassword().orElse("")))
+//                            .build()))
+                .build();
 
-//        // 1. 创建配置对象
-//            GenericObjectPoolConfig<Connection> poolConfig = new GenericObjectPoolConfig<>();
-//            poolConfig.setMaxTotal(20);           // 池中最大连接数 [citation:3][citation:10]
-//            poolConfig.setMaxIdle(5);             // 最大空闲连接数 [citation:1][citation:9]
-//            poolConfig.setMinIdle(2);              // 最小空闲连接数 [citation:1][citation:9]
-//            poolConfig.setMaxWaitMillis(3000);     // 获取连接的最大等待时间（毫秒） [citation:1][citation:10]
-//            poolConfig.setTestOnBorrow(true);      // 获取连接时是否验证，true能保证拿到的连接是有效的 [citation:1][citation:10]
-//            poolConfig.setTestWhileIdle(true);     // 是否开启空闲连接检测 [citation:1][citation:9]
-//
-//            // 2. 创建对象工厂
-//            FeConnectionFactory factory = new FeConnectionFactory(
-//                    config.getJdbcURL(),
-//                    config.getFeUser(),
-//                    config.getFePassword().orElse(""));
-//
-//            // 3. 将工厂和配置传给 GenericObjectPool，完成创建！
-//            GenericObjectPool<Connection> pool = new GenericObjectPool<>(factory, poolConfig);
-//            this.pool = pool;
-
-//            Driver driver = new Driver();
-//
-//            Properties properties = new Properties();
-//            properties.setProperty("user", config.getFeUser());
-//            properties.setProperty("password", config.getFePassword().orElse(""));
-//            properties.setProperty("characterEncoding", "UTF-8");
-//            properties.setProperty("connectTimeout", "5000");      // 连接超时 5秒
-//            properties.setProperty("socketTimeout", "30000");      // Socket 超时 30秒
-//            this.connectionFactory = new DriverConnectionFactory(driver, config.getJdbcURL(), properties);
-
-            this.httpClient = new OkHttpClient.Builder()
-                    .connectTimeout(30, TimeUnit.SECONDS)
-                    .readTimeout(30, TimeUnit.SECONDS)
-                    .authenticator(((route, response) -> response.request().newBuilder()
-                            .header("Authorization", Credentials.basic(config.getFeUser(), config.getFePassword().orElse("")))
-                            .build()))
-                    .build();
-
-
+        Ticker ticker = Ticker.systemTicker();
+        this.cacheMissing = config.isCacheMissing();
+        this.schemaNamesCache = buildCache(ticker, config.getCacheMaximumSize(), config.getSchemaNamesCacheTtl());
+        this.tableNamesCache = buildCache(ticker, config.getCacheMaximumSize(), config.getTableNamesCacheTtl());
+        this.tableHandlesByNameCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
+        this.tableHandlesByQueryCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
+        this.procedureHandlesByQueryCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
+        this.columnsCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
+        this.tableCommentsCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
+        this.statisticsCache = buildCache(ticker, config.getCacheMaximumSize(), config.getStatisticsCacheTtl());
+        this.tablePrimaryKeysCache = buildCache(ticker, config.getCacheMaximumSize(), config.getStatisticsCacheTtl());
+        this.tablePropertiesCache = buildCache(ticker, config.getCacheMaximumSize(), config.getMetadataCacheTtl());
 
     }
 
-    public List<String> getSchemaNames() {
+    private static <K, V> Cache<K, V> buildCache(Ticker ticker, long cacheSize, Duration cachingTtl)
+    {
+        return EvictableCacheBuilder.newBuilder()
+                .ticker(ticker)
+                .maximumSize(cacheSize)
+                .expireAfterWrite(cachingTtl.toMillis(), MILLISECONDS)
+                .shareNothingWhenDisabled()
+                .recordStats()
+                .build();
+    }
+
+    private static <K, V> V get(Cache<K, V> cache, K key, Callable<V> loader)
+    {
+        try {
+            return cache.get(key, loader);
+        }
+        catch (UncheckedExecutionException e) {
+            throwIfInstanceOf(e.getCause(), TrinoException.class);
+            throw e;
+        }
+        catch (ExecutionException e) {
+            throwIfInstanceOf(e.getCause(), TrinoException.class);
+            throw new UncheckedExecutionException(e);
+        }
+    }
+
+    public List<String> getSchemaNames(ConnectorSession session) {
         String sql = "SHOW DATABASES";
-        return getResultSet(sql);
+        return get(schemaNamesCache, session, () -> getResultSet(sql));
+
     }
 
     public List<String> getTableNames(String schemaName) {
+        TableListingCacheKey key = new TableListingCacheKey(schemaName);
         String sql = "SHOW TABLES FROM " + schemaName;
-        return getResultSet(sql);
+
+        return get(tableNamesCache, key, () -> getResultSet(sql));
     }
+
+
+    private List<String> getResultSet(String sql) {
+        ImmutableList.Builder<String> builder = ImmutableList.builder();
+        try (ClientPool.PooledConnection pooledConnection = clientPool.borrowPooledConnection(dorisConfig.getJdbcURL());
+                Statement statement = pooledConnection.getConnection().createStatement();
+                ResultSet resultSet = statement.executeQuery(sql)) {
+            while (resultSet.next()) {
+                builder.add(resultSet.getString(1).toLowerCase());
+            }
+            return builder.build();
+        }
+        catch (Exception e) {
+            log.error("get resultset failed");
+            throw new RuntimeException(e);
+        }
+    }
+
+//    public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table) {
+//        DorisTableHandle dorisTableHandle = (DorisTableHandle) table;
+//
+//        return new ConnectorTableMetadata(
+//                new SchemaTableName(dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()),
+//                getColumns(session, dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()).stream()
+//                        .map(DorisColumnHandle::getColumnMetadata)
+//                        .collect(ImmutableList.toImmutableList()),
+//                getTableProperties(session, dorisTableHandle),
+//                dorisTableHandle.getTableComment());
+//    }
+
+    public Map<String, Object> getTableProperties(ConnectorSession session, DorisTableHandle tableHandle)
+    {
+        return get(tablePropertiesCache, tableHandle, () -> getProperties(tableHandle));
+    }
+
+    private Map<String, Object> getProperties(DorisTableHandle tableHandle) {
+        String sql = format("SELECT PROPERTY_NAME, PROPERTY_VALUE FROM internal.information_schema.table_properties where TABLE_SCHEMA='%s' AND TABLE_NAME='%s'", tableHandle.getSchemaName(), tableHandle.getTableName());
+
+        ImmutableMap.Builder<String, Object> builder = ImmutableMap.builder();
+        try (ClientPool.PooledConnection pooledConnection = clientPool.borrowPooledConnection(dorisConfig.getJdbcURL());
+                Statement statement = pooledConnection.getConnection().createStatement();
+                ResultSet resultSet = statement.executeQuery(sql)) {
+            while (resultSet.next()) {
+                builder.put(resultSet.getString("PROPERTY_NAME"), resultSet.getString("PROPERTY_VALUE"));
+            }
+
+            return builder.build();
+        }
+        catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public Optional<DorisTableHandle> getTableHandle(ConnectorSession session, SchemaTableName tableName)
+    {
+        TableHandlesByNameCacheKey key = new TableHandlesByNameCacheKey(tableName);
+        Optional<DorisTableHandle> cachedTableHandle = tableHandlesByNameCache.getIfPresent(key);
+        //noinspection OptionalAssignedToNull
+        if (cachedTableHandle != null) {
+            if (cacheMissing) {
+                return cachedTableHandle;
+            }
+            tableHandlesByNameCache.invalidate(key);
+        }
+        return get(tableHandlesByNameCache, key, () -> getTable(session, tableName));
+    }
+
+    private Optional<DorisTableHandle> getTable(ConnectorSession session, SchemaTableName tableName) {
+        //        String sql = format("SHOW PARTITIONS FROM %s.%s.%s", "internal", schemaName, tableName);
+//        String commentSql = format("SELECT TABLE_COMMENT FROM internal.information_schema.tables WHERE TABLE_CATALOG='%s' AND TABLE_SCHEMA='%s' AND TABLE_NAME='%s'", "internal", schemaName, tableName);
+//
+//        log.debug("show partition sql : %s", sql);
+//        log.debug("comment sql : %s", commentSql);
+//        String[] partitionKey = null;
+//        String tableComment = null;
+//
+//        ResultSet resultSet = null;
+//        try (ClientPool.PooledConnection pooledConnection = clientPool.borrowPooledConnection(dorisConfig.getJdbcURL());
+//                Statement statement = pooledConnection.getConnection().createStatement()) {
+//            resultSet = statement.executeQuery(sql);
+//
+//            while (resultSet.next()) {
+//                partitionKey = resultSet.getString("PartitionKey").split(",");
+//            }
+//
+//            resultSet = statement.executeQuery(commentSql);
+//            while (resultSet.next()) {
+//                tableComment = resultSet.getString("TABLE_COMMENT");
+//            }
+//        }
+//        catch (Exception e) {
+//            log.error("get resultset failed");
+//            throw new RuntimeException(e);
+//        }
+//        finally {
+//            if (resultSet != null) {
+//                try {
+//                    resultSet.close();
+//                }
+//                catch (SQLException e) {
+//                    throw new RuntimeException(e);
+//                }
+//            }
+//        }
+
+        return Optional.of(new DorisTableHandle(
+                tableName.getSchemaName(),
+                tableName.getTableName(),
+//                ImmutableList.of(),
+                getColumns(session, tableName.getSchemaName(), tableName.getTableName()),
+                TupleDomain.all(),
+//                Optional.of(Arrays.asList(partitionKey)),
+                Optional.of(ImmutableList.of()),
+                TupleDomain.all(),
+//                Optional.of(Strings.nullToEmpty(tableComment)),
+                Optional.of(""),
+                0,
+                Optional.empty(),
+                Optional.empty()));
+    }
+
+    public List<DorisColumnHandle> getColumns(ConnectorSession session, String schemaName, String tableName)
+    {
+//        ColumnsCacheKey key = new ColumnsCacheKey(new SchemaTableName(schemaName, tableName));
+//        List<DorisColumnHandle> columns = columnsCache.getIfPresent(key);
+//        //noinspection OptionalAssignedToNull
+//        if (columns != null) {
+//            if (cacheMissing) {
+//                return columns;
+//            }
+//            columnsCache.invalidate(key);
+//        }
+//        return get(columnsCache, key, () -> getDorisColumns(session, schemaName, tableName));
+
+        List<DorisColumnHandle> columns = new ArrayList<>();
+
+        try (ClientPool.PooledConnection pooledConnection = clientPool.borrowPooledConnection(dorisConfig.getJdbcURL());
+                Statement statement = pooledConnection.getConnection().createStatement();
+                ResultSet resultSet = statement.executeQuery(format("DESC internal.%s.%s", schemaName, tableName))) {
+
+            while (resultSet.next()) {
+                columns.add(new DorisColumnHandle(
+                        resultSet.getString("Field"),
+                        resultSet.getString("NULL").equals("YES") ? true : false,
+                        TypeConverter.toTrinoType(resultSet.getString("Type")),
+                        Optional.empty()
+                ));
+            }
+        }
+        catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+
+        return columns;
+    }
+
+
+    private List<DorisColumnHandle> getDorisColumns(ConnectorSession session, String schemaName, String tableName) {
+        try (ClientPool.PooledConnection pooledConnection = clientPool.borrowPooledConnection(dorisConfig.getJdbcURL());
+                ResultSet resultSet = pooledConnection.getConnection().getMetaData().getColumns(schemaName, null, tableName, null)) {
+            Map<String, CaseSensitivity> caseSensitivityMapping = getCaseSensitivityForColumns(pooledConnection.getConnection(), new SchemaTableName(schemaName, tableName), new RemoteTableName(Optional.of("internal"), Optional.of(schemaName), tableName));
+            int allColumns = 0;
+            List<DorisColumnHandle> columns = new ArrayList<>();
+            while (resultSet.next()) {
+                // skip if table doesn't match expected
+                if (!Objects.equals(new RemoteTableName(Optional.of(schemaName), Optional.empty(), tableName), getRemoteTable(resultSet))) {
+                    continue;
+                }
+                allColumns++;
+                String columnName = resultSet.getString("COLUMN_NAME");
+                JdbcTypeHandle typeHandle = new JdbcTypeHandle(
+                        getInteger(resultSet, "DATA_TYPE").orElseThrow(() -> new IllegalStateException("DATA_TYPE is null")),
+                        Optional.ofNullable(resultSet.getString("TYPE_NAME")),
+                        getInteger(resultSet, "COLUMN_SIZE"),
+                        getInteger(resultSet, "DECIMAL_DIGITS"),
+                        Optional.empty(),
+                        Optional.ofNullable(caseSensitivityMapping.get(columnName)));
+                Optional<ColumnMapping> columnMapping = toColumnMapping(session, pooledConnection.getConnection(), typeHandle);
+                log.debug("Mapping data type of '%s' column '%s': %s mapped to %s", schemaName, columnName, typeHandle, columnMapping);
+                boolean nullable = (resultSet.getInt("NULLABLE") != columnNoNulls);
+                // Note: some databases (e.g. SQL Server) do not return column remarks/comment here.
+                Optional<String> comment = Optional.ofNullable(emptyToNull(resultSet.getString("REMARKS")));
+                // skip unsupported column types
+                columnMapping.ifPresent(mapping -> columns.add(DorisColumnHandle.builder()
+                        .setColumnName(columnName)
+//                        .setJdbcTypeHandle(typeHandle)
+                        .setColumnType(mapping.getType())
+                        .setNullable(nullable)
+                        .setComment(comment)
+                        .build()));
+                if (columnMapping.isEmpty()) {
+                    UnsupportedTypeHandling unsupportedTypeHandling = getUnsupportedTypeHandling(session);
+                    verify(
+                            unsupportedTypeHandling == IGNORE,
+                            "Unsupported type handling is set to %s, but toColumnMapping() returned empty for %s",
+                            unsupportedTypeHandling,
+                            typeHandle);
+                }
+            }
+            if (columns.isEmpty()) {
+                // A table may have no supported columns. In rare cases (e.g. PostgreSQL) a table might have no columns at all.
+                throw new TableNotFoundException(
+                        new SchemaTableName(schemaName, tableName),
+                        format("Table '%s' has no supported columns (all %s columns are not supported)", schemaName, allColumns));
+            }
+            return ImmutableList.copyOf(columns);
+        }
+        catch (Exception e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+    }
+
+
+
 
     public List<ConnectorSplit> getSplits(
             ConnectorSession session,
@@ -282,11 +558,15 @@ public class DorisFeClient
                 String requestBody = OBJECT_MAPPER.createObjectNode()
                         .put("sql", sql)
                         .toString();
+                log.info("doris fe query plan sql is : %s", sql);
+                log.info("request query plan url is : %s", format("http://%s/api/%s/%s/_query_plan", dorisConfig.getQueryPlanURL(), tableHandle.getSchemaName(), tableHandle.getTableName()));
 
                 okhttp3.Request request = new okhttp3.Request.Builder()
                         .url(format("http://%s/api/%s/%s/_query_plan", dorisConfig.getQueryPlanURL(), tableHandle.getSchemaName(), tableHandle.getTableName()))
+                        .header("Authorization", Credentials.basic(dorisConfig.getFeUser(), dorisConfig.getFePassword().orElse("")))
                         .post(RequestBody.create(requestBody, JSON))
                         .build();
+
 
                 okhttp3.Response response = httpClient.newCall(request).execute();
 
@@ -309,7 +589,7 @@ public class DorisFeClient
                 QueryPlanData queryPlanData = OBJECT_MAPPER.treeToValue(dataNode, QueryPlanData.class);
 
                 // Convert partitions to Map<String, List<Integer>> (BE IP:PORT -> Tablet IDs) using Stream API
-                Map<String, Set<Long>> beToTablets = buildBeToTabletsMap(queryPlanData.getPartitions());
+                Map<HostAddress, Set<Long>> beToTablets = buildBeToTabletsMap(queryPlanData.getPartitions());
 
                 return ImmutableList.of(new DorisSplit(queryPlanData.getOpaqued_query_plan(), beToTablets));
             }
@@ -333,12 +613,11 @@ public class DorisFeClient
             DynamicFilter dynamicFilter) {
         StringBuilder sql = new StringBuilder("SELECT ");
         // 构建要查找的列
-        List<DorisColumnHandle> columns = tableHandle.getColumns();
         ImmutableList<String> columnNames = tableHandle.getColumns().stream()
                 .map(DorisColumnHandle::getColumnName)
                 .collect(toImmutableList());
         sql.append(String.join(", ", columnNames));
-        sql.append(format("internal.%s.%s", tableHandle.getSchemaName(), tableHandle.getTableName()));
+        sql.append(format(" FROM internal.%s.%s", tableHandle.getSchemaName(), tableHandle.getTableName()));
 
         // 构建谓词
         ImmutableList.Builder<String> conjuncts = ImmutableList.builder();
@@ -395,152 +674,14 @@ public class DorisFeClient
 
         String whereClause = Joiner.on(" AND ").join(conjuncts.build());
         // todo lack of limit
-        sql.append(format(" WHERE %s", whereClause));
-
-        return sql.toString();
-    }
-
-    private List<String> getResultSet(String sql) {
-        ImmutableList.Builder<String> builder = ImmutableList.builder();
-        try (Connection connection = ClientPool.getFePool().borrowObject(dorisConfig.getJdbcURL());
-                Statement statement = connection.createStatement()) {
-            ResultSet resultSet = statement.executeQuery(sql);
-            while (resultSet.next()) {
-                builder.add(resultSet.getString(1).toLowerCase());
-            }
-            return builder.build();
-        }
-        catch (Exception e) {
-            log.error("get resultset failed");
-            throw new RuntimeException(e);
-        }
-    }
-
-    public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table) {
-        DorisTableHandle dorisTableHandle = (DorisTableHandle) table;
-
-        return new ConnectorTableMetadata(
-                new SchemaTableName(dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()),
-                getColumns(session, dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()).stream()
-                        .map(DorisColumnHandle::getColumnMetadata)
-                        .collect(ImmutableList.toImmutableList()),
-                getTableProperties(session, dorisTableHandle),
-                dorisTableHandle.getTableComment());
-     }
-
-    public Map<String, Object> getTableProperties(ConnectorSession session, DorisTableHandle tableHandle)
-    {
-        String sql = format("SELECT PROPERTY_NAME, PROPERTY_VALUE FROM information_schema.table_properties where TABLE_NAME=%s", tableHandle.getTableName());
-
-        ImmutableMap.Builder<String, Object> builder = ImmutableMap.builder();
-        try (Connection connection = ClientPool.getFePool().borrowObject(dorisConfig.getJdbcURL());
-                Statement statement = connection.createStatement()) {
-            ResultSet resultSet = statement.executeQuery(sql);
-            while (resultSet.next()) {
-                builder.put(resultSet.getString("PROPERTY_NAME"), resultSet.getString("PROPERTY_VALUE"));
-            }
-
-            return builder.build();
-        }
-        catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
-        catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-
-    public Optional<DorisTableHandle> getTableHandle(ConnectorSession session, String schemaName, String tableName)
-    {
-        String sql = format("SHOW PARTITIONS FROM %s.%s.%s", "internal", schemaName, tableName);
-        String commentSql = format("SELECT TABLE_COMMENT FROM internal.information_schema.tables WHERE TABLE_CATALOG=%s AND TABLE_SCHEMA=%s AND TABLE_NAME", "internal", schemaName, tableName);
-
-        String[] partitionKey = null;
-        String tableComment = null;
-        try (Connection connection = ClientPool.getFePool().borrowObject(dorisConfig.getJdbcURL());
-                Statement statement = connection.createStatement()) {
-            ResultSet resultSet = statement.executeQuery(sql);
-            while (resultSet.next()) {
-                partitionKey = resultSet.getString("PARTITION_KEY").split(",");
-            }
-
-            resultSet = statement.executeQuery(commentSql);
-            while (resultSet.next()) {
-                tableComment = resultSet.getString("TABLE_COMMENT");
-            }
-        }
-        catch (Exception e) {
-            log.error("get resultset failed");
-            throw new RuntimeException(e);
+        if (!Strings.isNullOrEmpty(whereClause)) {
+            sql.append(format(" WHERE %s", whereClause));
         }
 
-        return Optional.of(new DorisTableHandle(
-                schemaName,
-                tableName,
-                getColumns(session, schemaName, tableName),
-                TupleDomain.all(),
-                Optional.of(Arrays.asList(partitionKey)),
-                TupleDomain.all(),
-                Optional.of(Strings.nullToEmpty(tableComment)),
-                0,
-                Optional.empty(),
-                Optional.empty()));
-    }
+        String ans = sql.toString();
+        log.info("look at send to fe sql is : %s", ans);
 
-    public List<DorisColumnHandle> getColumns(ConnectorSession session, String schemaName, String tableName) {
-        try (Connection connection = ClientPool.getFePool().borrowObject(dorisConfig.getJdbcURL());
-                ResultSet resultSet = connection.getMetaData().getColumns("internal", schemaName, tableName, null)) {
-            Map<String, CaseSensitivity> caseSensitivityMapping = getCaseSensitivityForColumns(connection, new SchemaTableName(schemaName, tableName), new RemoteTableName(Optional.of("internal"), Optional.of(schemaName), tableName));
-            int allColumns = 0;
-            List<DorisColumnHandle> columns = new ArrayList<>();
-            while (resultSet.next()) {
-                // skip if table doesn't match expected
-                if (!Objects.equals(new RemoteTableName(Optional.of("internal"), Optional.of(schemaName), tableName), getRemoteTable(resultSet))) {
-                    continue;
-                }
-                allColumns++;
-                String columnName = resultSet.getString("COLUMN_NAME");
-                JdbcTypeHandle typeHandle = new JdbcTypeHandle(
-                        getInteger(resultSet, "DATA_TYPE").orElseThrow(() -> new IllegalStateException("DATA_TYPE is null")),
-                        Optional.ofNullable(resultSet.getString("TYPE_NAME")),
-                        getInteger(resultSet, "COLUMN_SIZE"),
-                        getInteger(resultSet, "DECIMAL_DIGITS"),
-                        Optional.empty(),
-                        Optional.ofNullable(caseSensitivityMapping.get(columnName)));
-                Optional<ColumnMapping> columnMapping = toColumnMapping(session, connection, typeHandle);
-                log.debug("Mapping data type of '%s' column '%s': %s mapped to %s", schemaName, columnName, typeHandle, columnMapping);
-                boolean nullable = (resultSet.getInt("NULLABLE") != columnNoNulls);
-                // Note: some databases (e.g. SQL Server) do not return column remarks/comment here.
-                Optional<String> comment = Optional.ofNullable(emptyToNull(resultSet.getString("REMARKS")));
-                // skip unsupported column types
-                columnMapping.ifPresent(mapping -> columns.add(DorisColumnHandle.builder()
-                        .setColumnName(columnName)
-//                        .setJdbcTypeHandle(typeHandle)
-                        .setColumnType(mapping.getType())
-                        .setNullable(nullable)
-                        .setComment(comment)
-                        .build()));
-                if (columnMapping.isEmpty()) {
-                    UnsupportedTypeHandling unsupportedTypeHandling = getUnsupportedTypeHandling(session);
-                    verify(
-                            unsupportedTypeHandling == IGNORE,
-                            "Unsupported type handling is set to %s, but toColumnMapping() returned empty for %s",
-                            unsupportedTypeHandling,
-                            typeHandle);
-                }
-            }
-            if (columns.isEmpty()) {
-                // A table may have no supported columns. In rare cases (e.g. PostgreSQL) a table might have no columns at all.
-                throw new TableNotFoundException(
-                        new SchemaTableName(schemaName, tableName),
-                        format("Table '%s' has no supported columns (all %s columns are not supported)", schemaName, allColumns));
-            }
-            return ImmutableList.copyOf(columns);
-        }
-        catch (Exception e) {
-            throw new TrinoException(JDBC_ERROR, e);
-        }
+        return ans;
     }
 
     private static Optional<Integer> getInteger(ResultSet resultSet, String columnLabel)
@@ -912,18 +1053,78 @@ public class DorisFeClient
         return Optional.empty();
     }
 
-    private Map<String, Set<Long>> buildBeToTabletsMap(Map<String, PartitionInfo> partitions)
+    private Map<HostAddress, Set<Long>> buildBeToTabletsMap(Map<String, PartitionInfo> partitions)
     {
-        Map<String, Set<Long>> builder = Maps.newHashMap();
+        Map<HostAddress, Set<Long>> builder = Maps.newHashMap();
+        Map<String, HostAddress> addressCache = Maps.newHashMap();
+
         partitions.entrySet().forEach(entry -> {
             String tabletId = entry.getKey();
             entry.getValue().getRoutings().stream()
                     .forEach(routing -> {
-                        builder.computeIfAbsent(routing, k -> new HashSet<>()).add(Long.valueOf(tabletId));
+                        addressCache.computeIfAbsent(routing, r -> {
+                            String[] splits = r.split(":");
+//                            HostAddress hostAddress = HostAddress.fromParts(splits[0], Integer.valueOf(splits[1]));
+                            HostAddress hostAddress = HostAddress.fromParts("127.0.0.1", Integer.valueOf(splits[1]));
+                            return hostAddress;
+                        });
+                        builder.computeIfAbsent(addressCache.get(routing), k -> new HashSet<>()).add(Long.valueOf(tabletId));
                     });
         });
 
         return builder;
+    }
+
+
+    private record ColumnsCacheKey( SchemaTableName table)
+    {
+        private ColumnsCacheKey
+        {
+//            sessionProperties = ImmutableMap.copyOf(requireNonNull(sessionProperties, "sessionProperties is null"));
+            requireNonNull(table, "table is null");
+        }
+    }
+
+    private record TableHandlesByNameCacheKey(SchemaTableName tableName)
+    {
+        private TableHandlesByNameCacheKey
+        {
+            requireNonNull(tableName, "tableName is null");
+        }
+    }
+
+    private record TableHandlesByQueryCacheKey(IdentityCacheMapping.IdentityCacheKey identity, PreparedQuery preparedQuery)
+    {
+        private TableHandlesByQueryCacheKey
+        {
+            requireNonNull(identity, "identity is null");
+            requireNonNull(preparedQuery, "preparedQuery is null");
+        }
+    }
+
+    private record ProcedureHandlesByQueryCacheKey(IdentityCacheMapping.IdentityCacheKey identity, JdbcProcedureHandle.ProcedureQuery procedureQuery)
+    {
+        private ProcedureHandlesByQueryCacheKey
+        {
+            requireNonNull(identity, "identity is null");
+            requireNonNull(procedureQuery, "procedureQuery is null");
+        }
+    }
+
+    private record TableListingCacheKey(String schemaName)
+    {
+        private TableListingCacheKey
+        {
+            requireNonNull(schemaName, "schemaName is null");
+        }
+    }
+
+    private record SchemaListingCacheKey(String schemaName)
+    {
+        private SchemaListingCacheKey
+        {
+            requireNonNull(schemaName, "schemaName is null");
+        }
     }
 
 }

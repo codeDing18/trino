@@ -66,6 +66,7 @@
         <module>plugin/trino-cassandra</module>
         <module>plugin/trino-clickhouse</module>
         <module>plugin/trino-delta-lake</module>
+        <module>plugin/trino-doris</module>
         <module>plugin/trino-druid</module>
         <module>plugin/trino-duckdb</module>
         <module>plugin/trino-elasticsearch</module>
@@ -119,7 +120,6 @@
         <module>plugin/trino-tpcds</module>
         <module>plugin/trino-tpch</module>
         <module>plugin/trino-vertica</module>
-        <module>plugin/trino-doris</module>
         <module>service/trino-proxy</module>
         <module>service/trino-verifier</module>
         <module>testing/trino-benchmark-queries</module>

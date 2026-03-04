@@ -1,12 +1,27 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.trino.plugin.doris;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
 import com.google.common.io.Closer;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.airlift.log.Logger;
+import io.trino.metadata.Split;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.connector.ConnectorSplitSource;
@@ -14,14 +29,20 @@ import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.DynamicFilter;
+import io.trino.split.SplitSource;
 import org.eclipse.jetty.http2.api.Session;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.concurrent.MoreFutures.toCompletableFuture;
+import static io.airlift.concurrent.MoreFutures.toListenableFuture;
+import static java.util.Collections.emptyIterator;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 public class DorisSplitSource implements ConnectorSplitSource
@@ -39,6 +60,7 @@ public class DorisSplitSource implements ConnectorSplitSource
     private final DorisTableHandle tableHandle;
     private final Constraint constraint;
 
+    private volatile boolean finished;
 
 
     @GuardedBy("closer")
@@ -101,7 +123,7 @@ public class DorisSplitSource implements ConnectorSplitSource
                         session,
                         tableHandle,
                         dynamicFilter),
-                isFinished());
+                true);
     }
 
 
@@ -109,6 +131,22 @@ public class DorisSplitSource implements ConnectorSplitSource
     public void close()
     {
         closeInternal(true);
+    }
+
+    @Override
+    public boolean isFinished()
+    {
+        if (currentBatchFuture.isDone()) {
+            finish();
+            return true;
+        }
+        return false;
+    }
+
+    private synchronized void finish()
+    {
+        closeInternal(false);
+        this.finished = true;
     }
 
     private void closeInternal(boolean interruptIfRunning)
@@ -132,9 +170,5 @@ public class DorisSplitSource implements ConnectorSplitSource
         }
     }
 
-    @Override
-    public boolean isFinished()
-    {
-        return false;
-    }
+
 }

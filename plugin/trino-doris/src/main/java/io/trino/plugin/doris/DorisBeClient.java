@@ -1,7 +1,22 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.trino.plugin.doris;
 
 import com.google.common.collect.ImmutableMap;
 import io.airlift.log.Logger;
+import io.trino.spi.HostAddress;
+import jakarta.inject.Inject;
 import org.apache.doris.sdk.thrift.TDorisExternalService;
 import org.apache.doris.sdk.thrift.TNetworkAddress;
 import org.apache.doris.sdk.thrift.TScanBatchResult;
@@ -37,9 +52,12 @@ public class DorisBeClient
 
 //    private final Map<String, TDorisExternalService.Client> beClients;
     private final ExecutorService executor = Executors.newFixedThreadPool(3);
+    private final ClientPool clientPool;
 
-    public DorisBeClient()
+    @Inject
+    public DorisBeClient(ClientPool clientPool)
     {
+        this.clientPool = clientPool;
 //        this.executor = requireNonNull(executor, "executor is null");
 //        this.beClients = new HashMap<>();
     }
@@ -47,17 +65,16 @@ public class DorisBeClient
     public List<DorisBeReader> executeSplit(DorisTableHandle tableHandle,DorisSplit split)
     {
         String queryPlan = split.getOpaquedQueryPlan();
-        Map<String, Set<Long>> beToTablets = split.getBeToTablets();
+        Map<HostAddress, Set<Long>> beToTablets = split.getBeToTablets();
 
         log.debug("Executing split with query plan, BE count: %d", beToTablets.size());
 
         List<CompletableFuture<DorisBeReader>> futures = new ArrayList<>();
 
-        for (Map.Entry<String, Set<Long>> entry : beToTablets.entrySet()) {
-            String beAddress = entry.getKey();
+        for (Map.Entry<HostAddress, Set<Long>> entry : beToTablets.entrySet()) {
             Set<Long> tabletIds = entry.getValue();
 
-            futures.add(sendQueryToBE(tableHandle, beAddress, queryPlan, tabletIds));
+            futures.add(sendQueryToBE(tableHandle, entry.getKey(), queryPlan, tabletIds));
         }
 
         // join的话会阻塞，应该直接返回future
@@ -70,15 +87,14 @@ public class DorisBeClient
 
     private CompletableFuture<DorisBeReader> sendQueryToBE(
             DorisTableHandle tableHandle,
-            String beAddress,
+            HostAddress hostAddress,
             String queryPlan,
             Set<Long> tabletIds)
     {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                String[] split = beAddress.split(":");
-                TNetworkAddress networkAddress = new TNetworkAddress(split[0], Integer.valueOf(split[1]));
-                TDorisExternalService.Client client = ClientPool.getBePool().borrowObject(networkAddress);
+                TNetworkAddress networkAddress = new TNetworkAddress(hostAddress.getHostText(), hostAddress.getPort());
+                TDorisExternalService.Client client = clientPool.getBePool().borrowObject(networkAddress);
 
                 TScanOpenParams scanParams = new TScanOpenParams();
                 scanParams.setCluster("internal");
@@ -86,20 +102,21 @@ public class DorisBeClient
                 scanParams.setTable(tableHandle.getTableName());
                 scanParams.setTabletIds(new ArrayList<>(tabletIds));
                 scanParams.setOpaquedQueryPlan(queryPlan);
+                scanParams.setBatchSize(100);
 
-                log.debug("Sending query to BE %s for %d tablets", beAddress, tabletIds.size());
+                log.debug("Sending query to BE %s for %d tablets", hostAddress.getHostText(), tabletIds.size());
 
                 TScanOpenResult openResult = client.openScanner(scanParams);
 
                 String scanId = openResult.getContextId();
 
-                log.debug("Scan opened on BE %s with scan ID: %s", beAddress, scanId);
+                log.debug("Scan opened on BE %s with scan ID: %s", hostAddress.getHostText(), scanId);
 
-                return new DorisBeReader(client, scanId, networkAddress);
+                return new DorisBeReader(client, scanId, networkAddress, clientPool);
             }
             catch (Exception e) {
-                log.error("Failed to send query to BE %s", beAddress, e);
-                throw new RuntimeException("Failed to send query to BE: " + beAddress, e);
+                log.error("Failed to send query to BE %s", hostAddress.getHostText(), e);
+                throw new RuntimeException("Failed to send query to BE: " + hostAddress.getHostText(), e);
             }
         }, executor);
     }

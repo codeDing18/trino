@@ -1,3 +1,16 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.trino.plugin.doris;
 
 import com.google.common.collect.ImmutableList;
@@ -6,6 +19,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcTableHandle;
+import io.trino.plugin.jdbc.RemoteTableName;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.AggregationApplicationResult;
@@ -16,6 +30,7 @@ import io.trino.spi.connector.ConnectorMetadata;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.ConnectorTableSchema;
 import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
@@ -31,11 +46,13 @@ import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.AccessDeniedException;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
@@ -43,75 +60,87 @@ import static java.util.Objects.requireNonNull;
 
 public class DorisMetadata implements ConnectorMetadata
 {
-    private final DorisClient dorisClient;
+    private final DorisFeClient feClient;
     private final boolean precalculateStatisticsForPushdown;
 
-
-    @Inject
-    public DorisMetadata(DorisClient DorisClient)
+    public DorisMetadata(DorisFeClient feClient)
     {
-        this.dorisClient = requireNonNull(DorisClient, "DorisClient is null");
+        this.feClient = requireNonNull(feClient, "feClient is null");
         this.precalculateStatisticsForPushdown = true;
     }
 
     @Override
     public List<String> listSchemaNames(ConnectorSession session)
     {
-        return ImmutableList.copyOf(dorisClient.getFeClient().getSchemaNames());
+        return ImmutableList.copyOf(feClient.getSchemaNames(session));
     }
 
     @Override
     public DorisTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName, Optional<ConnectorTableVersion> startVersion, Optional<ConnectorTableVersion> endVersion)
     {
-        return dorisClient.getFeClient().getTableHandle(session, tableName.getSchemaName(), tableName.getTableName()).orElse(null);
+        return feClient.getTableHandle(session, tableName).orElse(null);
+    }
+
+    @Override
+    public SchemaTableName getTableName(ConnectorSession session, ConnectorTableHandle table)
+    {
+        DorisTableHandle dorisTableHandle = (DorisTableHandle) table;
+         return new SchemaTableName(dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName());
+    }
+
+    @Override
+    public ConnectorTableSchema getTableSchema(ConnectorSession session, ConnectorTableHandle table)
+    {
+        DorisTableHandle handle = (DorisTableHandle) table;
+        return new ConnectorTableSchema(
+                new SchemaTableName(handle.getSchemaName(), handle.getTableName()),
+                handle.getColumns().stream().map(DorisColumnHandle::getColumnSchema).collect(toImmutableList()));
     }
 
     @Override
     public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table)
     {
-        return dorisClient.getFeClient().getTableMetadata(session, table);
+        DorisTableHandle dorisTableHandle = (DorisTableHandle) table;
+
+        return new ConnectorTableMetadata(
+                new SchemaTableName(dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()),
+                dorisTableHandle.getColumns().stream().map(DorisColumnHandle::getColumnMetadata).collect(toImmutableList()),
+                feClient.getTableProperties(session, dorisTableHandle),
+                dorisTableHandle.getTableComment());
     }
 
     @Override
-    public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> optionalSchemaName)
+    public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
     {
-        Set<String> schemaNames = optionalSchemaName.map(ImmutableSet::of)
-                .orElseGet(() -> ImmutableSet.copyOf(dorisClient.getFeClient().getSchemaNames()));
-
-        ImmutableList.Builder<SchemaTableName> builder = ImmutableList.builder();
-        for (String schemaName : schemaNames) {
-            for (String tableName : dorisClient.getFeClient().getTableNames(schemaName)) {
-                builder.add(new SchemaTableName(schemaName, tableName));
-            }
+        if (!schemaName.isPresent()) {
+            return Collections.emptyList();
         }
-        return builder.build();
+
+        return feClient.getTableNames(schemaName.get()).stream()
+                .map(tableName -> new SchemaTableName(schemaName.get(), tableName))
+                .collect(ImmutableList.toImmutableList());
     }
 
     @Override
     public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
         DorisTableHandle dorisTableHandle = (DorisTableHandle) tableHandle;
+
         return dorisTableHandle.getColumns().stream()
                 .collect(ImmutableMap.toImmutableMap(column -> column.getColumnName(), Function.identity()));
+
+//        return feClient.getColumns(session, dorisTableHandle.getSchemaName(), dorisTableHandle.getTableName()).stream()
+//                .collect(ImmutableMap.toImmutableMap(column -> column.getColumnName(), Function.identity()));
     }
 
     @Override
     public Map<SchemaTableName, List<ColumnMetadata>> listTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
     {
         ImmutableMap.Builder<SchemaTableName, List<ColumnMetadata>> columns = ImmutableMap.builder();
-        List<SchemaTableName> tables = prefix.toOptionalSchemaTableName()
-                .<List<SchemaTableName>>map(ImmutableList::of)
-                .orElseGet(() -> listTables(session, prefix.getSchema()));
-        for (SchemaTableName tableName : tables) {
-            try {
-                dorisClient.getFeClient().getTableHandle(session, tableName.getSchemaName(), tableName.getTableName())
-                        .ifPresent(tableHandle -> columns.put(tableName, getColumnMetadata(session, tableHandle)));
-            }
-            catch (TableNotFoundException | AccessDeniedException e) {
-                // table disappeared during listing operation or user is not allowed to access it
-                // these exceptions are ignored because listTableColumns is used for metadata queries (SELECT FROM information_schema)
-            }
-        }
+
+        prefix.toOptionalSchemaTableName().ifPresent(tableName -> feClient.getTableHandle(session, tableName)
+                    .ifPresent(tableHandle -> columns.put(tableName, tableHandle.getColumns().stream().map(DorisColumnHandle::getColumnMetadata).toList())));
+
         return columns.buildOrThrow();
     }
 
@@ -186,23 +215,6 @@ public class DorisMetadata implements ConnectorMetadata
                 precalculateStatisticsForPushdown));
     }
 
-    public List<ColumnMetadata> getColumnMetadata(ConnectorSession session, DorisTableHandle tableHandle)
-    {
-        return getColumnHandles(session, tableHandle).values()
-                .stream()
-                .map(JdbcColumnHandle.class::cast)
-                .map(JdbcColumnHandle::getColumnMetadata)
-                .collect(toImmutableList());
-    }
-
-    private List<SchemaTableName> listTables(ConnectorSession session, SchemaTablePrefix prefix)
-    {
-        if (prefix.getTable().isEmpty()) {
-            return listTables(session, prefix.getSchema());
-        }
-        return ImmutableList.of(prefix.toSchemaTableName());
-    }
-
     @Override
     public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle)
     {
@@ -219,31 +231,31 @@ public class DorisMetadata implements ConnectorMetadata
     {
         // For now, we'll implement a simplified version that leverages BaseJdbcClient
         // This will be enhanced later to support Doris-specific features
-        
+
         // Validate inputs
         if (aggregates == null || aggregates.isEmpty()) {
             // No aggregate functions, no need to push down
             return Optional.empty();
         }
-        
+
         if (groupingSets == null || groupingSets.isEmpty()) {
             // No grouping sets provided, which is invalid for aggregation
             return Optional.empty();
         }
-        
+
         // Global aggregation (with no grouping sets) is represented by [[]]
         if (groupingSets.equals(List.of(List.of())) && aggregates.isEmpty()) {
             // Global aggregation with no aggregate functions is not sensible
             return Optional.empty();
         }
-        
+
         // Check if Doris FE client supports aggregation pushdown
         // Note: DorisFeClient extends BaseJdbcClient which has default implementation
         // We'll rely on that for now
-        
+
         // Create a simplified result that indicates aggregation could be pushed down
         // This is a placeholder until we fully integrate with BaseJdbcClient
-        
+
         return Optional.empty();
     }
 
@@ -260,20 +272,20 @@ public class DorisMetadata implements ConnectorMetadata
     {
         // For now, we'll implement a simplified version
         // This will be enhanced later to support Doris-specific features
-        
+
         // Validate inputs
         if (joinCondition == null) {
             // No join condition, cannot push down
             return Optional.empty();
         }
-        
+
         // Check if the join type is supported
         // Doris supports INNER, LEFT, RIGHT, and FULL joins
         // (similar to MySQL)
-        
+
         // Create a simplified result that indicates join could be pushed down
         // This is a placeholder until we fully integrate with BaseJdbcClient
-        
+
         return Optional.empty();
     }
 }
